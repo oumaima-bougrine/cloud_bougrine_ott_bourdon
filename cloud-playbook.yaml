@@ -1,0 +1,299 @@
+- name: Deploy Wordpress full architecture
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  environment:
+    AZURE_TENANT: "{{ azure_tenant }}"
+    AZURE_SUBSCRIPTION_ID: "{{ azure_subscription_id }}"
+    AZURE_CLIENT_ID: "{{ azure_client_id }}"
+    AZURE_SECRET: "{{ azure_secret }}"
+
+  vars:
+    rg_name: wordpress-rg
+    location: "northeurope"
+    vnet_name: wordpress-vnet
+    my_ip: "82.224.135.117"
+    vm_size: Standard_F1als_v7
+
+  tasks:
+
+  # RESOURCE GROUP
+  - name: Create resource group
+    azure.azcollection.azure_rm_resourcegroup:
+      name: "{{ rg_name }}"
+      location: "{{ location }}"
+
+  # NETWORK
+  - name: Create virtual network
+    azure.azcollection.azure_rm_virtualnetwork:
+      resource_group: "{{ rg_name }}"
+      name: "{{ vnet_name }}"
+      address_prefixes: "10.0.0.0/16"
+
+  - name: Create subnet jumpoff
+    azure.azcollection.azure_rm_subnet:
+      resource_group: "{{ rg_name }}"
+      virtual_network_name: "{{ vnet_name }}"
+      name: subnet-jumpoff
+      address_prefix: "10.0.1.0/24"
+
+  - name: Create subnet app
+    azure.azcollection.azure_rm_subnet:
+      resource_group: "{{ rg_name }}"
+      virtual_network_name: "{{ vnet_name }}"
+      name: subnet-app
+      address_prefix: "10.0.2.0/24"
+
+  - name: Create subnet data
+    azure.azcollection.azure_rm_subnet:
+      resource_group: "{{ rg_name }}"
+      virtual_network_name: "{{ vnet_name }}"
+      name: subnet-data
+      address_prefix: "10.0.3.0/24"
+
+  # NSG
+  - name: NSG jumpoff
+    azure.azcollection.azure_rm_securitygroup:
+      resource_group: "{{ rg_name }}"
+      name: jumpoff-nsg
+      rules:
+        - name: SSH
+          protocol: Tcp
+          destination_port_range: 22
+          source_address_prefix: "{{ my_ip }}"
+          access: Allow
+          priority: 100
+
+  - name: NSG app
+    azure.azcollection.azure_rm_securitygroup:
+      resource_group: "{{ rg_name }}"
+      name: app-nsg
+      rules:
+        - name: HTTP
+          protocol: Tcp
+          destination_port_range: 80
+          source_address_prefix: "{{ my_ip }}"
+          access: Allow
+          priority: 100
+
+        - name: HTTPS
+          protocol: Tcp
+          destination_port_range: 443
+          source_address_prefix: "{{ my_ip }}"
+          access: Allow
+          priority: 110
+        - name: Allow-SSH-from-Jumpoff
+          protocol: Tcp
+          destination_port_range: 22
+          source_address_prefix: "10.0.1.0/24"
+          access: Allow
+          priority: 120
+
+  - name: NSG data
+    azure.azcollection.azure_rm_securitygroup:
+      resource_group: "{{ rg_name }}"
+      name: data-nsg
+      rules:
+        - name: MySQL
+          protocol: Tcp
+          destination_port_range: 3306
+          source_address_prefix: "10.0.2.0/24"
+          access: Allow
+          priority: 100
+
+  # PUBLIC IP + LOAD BALANCER
+  - name: Public IP
+    azure.azcollection.azure_rm_publicipaddress:
+      resource_group: "{{ rg_name }}"
+      name: lb-pip
+      allocation_method: Static
+      sku: Standard
+
+  - name: Load Balancer
+    azure.azcollection.azure_rm_loadbalancer:
+      sku: Standard
+      resource_group: "{{ rg_name }}"
+      name: wordpress-lb
+      frontend_ip_configurations:
+        - name: lb-frontend
+          public_ip_address: lb-pip
+      backend_address_pools:
+        - name: lb-backend
+      probes:
+        - name: http-probe
+          protocol: Tcp
+          port: 80
+      load_balancing_rules:
+        - name: http-rule
+          protocol: Tcp
+          frontend_port: 80
+          backend_port: 80
+          frontend_ip_configuration: lb-frontend
+          backend_address_pool: lb-backend
+          probe: http-probe
+        - name: https-rule
+          protocol: Tcp
+          frontend_port: 443
+          backend_port: 443
+          frontend_ip_configuration: lb-frontend
+          backend_address_pool: lb-backend
+          probe: http-probe
+
+  # NIC JUMPOFF
+  - name: Public IP Jumpoff
+    azure.azcollection.azure_rm_publicipaddress:
+      resource_group: "{{ rg_name }}"
+      name: jumpoff-pip
+      allocation_method: Static
+      sku: Standard
+
+  - name: NIC jumpoff
+    azure.azcollection.azure_rm_networkinterface:
+      resource_group: "{{ rg_name }}"
+      name: jumpoff-nic
+      virtual_network: "{{ vnet_name }}"
+      subnet: subnet-jumpoff
+      security_group: jumpoff-nsg
+      ip_configurations:
+        - name: ipconfig1
+          public_ip_address_name: jumpoff-pip
+
+  # VM JUMPOFF
+  - name: VM jumpoff
+    azure.azcollection.azure_rm_virtualmachine:
+      resource_group: "{{ rg_name }}"
+      name: jumpoff-vm
+      vm_size: "{{ vm_size }}"
+      managed_disk_type: Standard_LRS
+      os_disk_size_gb: 30
+      admin_username: azureuser
+      ssh_password_enabled: false
+      ssh_public_keys:
+        - path: "/home/azureuser/.ssh/authorized_keys"
+          key_data: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+      network_interfaces: jumpoff-nic
+      image:
+        offer: ubuntu-24_04-lts
+        publisher: Canonical
+        sku: server
+        version: latest
+
+  # NIC APP
+  - name: NIC app VMs
+    azure.azcollection.azure_rm_networkinterface:
+      resource_group: "{{ rg_name }}"
+      name: "app-nic-{{ item }}"
+      virtual_network: "{{ vnet_name }}"
+      subnet: subnet-app
+      security_group: app-nsg
+      ip_configurations:
+        - name: ipconfig1
+          load_balancer_backend_address_pools:
+            - name: lb-backend
+              load_balancer: wordpress-lb
+    loop:
+      - 1
+      - 2
+
+  # VM APP
+  - name: VM app
+    azure.azcollection.azure_rm_virtualmachine:
+      resource_group: "{{ rg_name }}"
+      name: "app-vm-{{ item }}"
+      vm_size: "{{ vm_size }}"
+      managed_disk_type: Standard_LRS
+      os_disk_size_gb: 30
+      admin_username: azureuser
+      ssh_password_enabled: false
+      ssh_public_keys:
+        - path: "/home/azureuser/.ssh/authorized_keys"
+          key_data: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+      network_interfaces: "app-nic-{{ item }}"
+      custom_data: "{{ lookup('file', 'cloud-init.yaml') }}"
+      image:
+        offer: ubuntu-24_04-lts
+        publisher: Canonical
+        sku: server
+        version: latest
+    loop:
+      - 1
+      - 2
+
+  # AUTO-SHUTDOWN
+  - name: Configure Auto-shutdown
+    azure.azcollection.azure_rm_resource:
+      resource_group: "{{ rg_name }}"
+      resource_name: "shutdown-computevm-app-vm-{{ item }}"
+      resource_type: "schedules"
+      provider: "devtestlab"
+      api_version: "2018-09-15"
+      body:
+        location: "{{ location }}"
+        properties:
+          status: "Enabled"
+          taskType: "ComputeVmShutdownTask"
+          dailyRecurrence:
+            time: "1900"
+          timeZoneId: "W. Europe Standard Time"
+          targetResourceId: "/subscriptions/{{ azure_subscription_id }}/resourceGroups/{{ rg_name }}/providers/Microsoft.Compute/virtualMachines/app-vm-{{ item }}"
+    loop:
+      - 1
+      - 2
+
+  - name: Configure Auto-shutdown Jumpoff
+    azure.azcollection.azure_rm_resource:
+      resource_group: "{{ rg_name }}"
+      resource_name: "shutdown-computevm-jumpoff-vm"
+      resource_type: "schedules"
+      provider: "devtestlab"
+      api_version: "2018-09-15"
+      body:
+        location: "{{ location }}"
+        properties:
+          status: "Enabled"
+          taskType: "ComputeVmShutdownTask"
+          dailyRecurrence:
+            time: "1900"
+          timeZoneId: "W. Europe Standard Time"
+          targetResourceId: "/subscriptions/{{ azure_subscription_id }}/resourceGroups/{{ rg_name }}/providers/Microsoft.Compute/virtualMachines/jumpoff-vm"
+
+  # MYSQL
+  - name: MySQL flexible server
+    azure.azcollection.azure_rm_mysqlflexibleserver:
+      resource_group: "{{ rg_name }}"
+      name: "mysql-wp-ouma"
+      location: "{{ location }}"
+      administrator_login: wpadmin
+      administrator_login_password: "Password1234!"
+      sku:
+        name: Standard_B1ms
+        tier: Burstable
+      storage:
+        storage_size_gb: 32
+      version: "8.0.21"
+    register: mysql_info
+
+  # Commande shell (Désactive TLS)
+  - name: Disable MySQL TLS (az cli)
+    shell: |
+      az mysql flexible-server parameter set \
+        --resource-group {{ rg_name }} \
+        --server-name mysql-wp-ouma \
+        --name require_secure_transport \
+        --value OFF
+
+  # PRIVATE ENDPOINT
+  - name: Private endpoint MySQL
+    azure.azcollection.azure_rm_privateendpoint:
+      resource_group: "{{ rg_name }}"
+      name: mysql-private-endpoint
+      location: "{{ location }}"
+      subnet: subnet-data
+      virtual_network: "{{ vnet_name }}"
+      private_link_service_connections:
+        - name: mysqlConnection
+          private_link_service_id: "{{ mysql_info.id }}"
+          group_ids:
+            - mysqlServer
+
